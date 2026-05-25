@@ -74,8 +74,6 @@ func main() {
 }
 ```
 
-（注意：本仓库的包导入路径在 go.mod 中声明为 `github.com/Ling0727-ai/go-buct-course`，而源码里使用的局部导入可能需要在你自己的项目中根据模块路径调整。）
-
 主要 API（概览）
 
 - package client
