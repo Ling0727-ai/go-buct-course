@@ -4,14 +4,15 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 
 	"github.com/Ling0727-ai/go-buct-course/exceptions"
-	"github.com/Ling0727-ai/go-buct-course/lid_utils" // 修正包引用路径
-	"github.com/Ling0727-ai/go-buct-course/utils"     // 引入转码工具
+	"github.com/Ling0727-ai/go-buct-course/lid_utils"
+	"github.com/Ling0727-ai/go-buct-course/utils"
 )
 
 // Homework 作业详情结构体
@@ -96,6 +97,15 @@ func (m *Manager) GetCourseDetails(lidStr string) (*CourseDetail, error) {
 	})
 
 	if homeworkLink == "" {
+		// 尝试特殊方式获取作业
+		specialResults, err := m.getHomeworkDetailSpecial1(lidStr)
+		if err == nil && len(specialResults) > 0 {
+			return &CourseDetail{
+				LID:          lidStr,
+				HomeworkList: specialResults,
+				TotalCount:   len(specialResults),
+			}, nil
+		}
 		return &CourseDetail{LID: lidStr, HomeworkList: []*Homework{}, TotalCount: 0}, nil
 	}
 
@@ -116,7 +126,18 @@ func (m *Manager) GetCourseDetails(lidStr string) (*CourseDetail, error) {
 		return nil, fmt.Errorf("fetch homework page failed: %w", err)
 	}
 
-	return m.parseHomeworkTable(hwDoc, lidStr), nil
+	result := m.parseHomeworkTable(hwDoc, lidStr)
+
+	// 如果常规方式未解析到任何列表，尝试特殊方式
+	if result.TotalCount == 0 {
+		specialResults, err := m.getHomeworkDetailSpecial1(lidStr)
+		if err == nil && len(specialResults) > 0 {
+			result.HomeworkList = specialResults
+			result.TotalCount = len(specialResults)
+		}
+	}
+
+	return result, nil
 }
 
 // GetHomeworkDetail 获取单个作业详情
@@ -240,6 +261,285 @@ func (m *Manager) GetAllPendingHomeworkDetails() ([]*CourseDetail, error) {
 // =================================================================================
 // 内部私有方法 (Helpers)
 // =================================================================================
+
+// getHomeworkDetailSpecial1 获取单个作业的详细信息（特殊处理版本1）
+// 在常规方式无法找到作业时调用，通过遍历栏目获取各项作业。
+// 对应 Python: get_homework_detail_special1
+func (m *Manager) getHomeworkDetailSpecial1(courseID string) ([]*Homework, error) {
+	courseMainURL := fmt.Sprintf("%s/meol/jpk/course/layout/newpage/index.jsp?courseId=%s", m.BaseURL, courseID)
+
+	mainDoc, err := m.fetchDocument(courseMainURL, "")
+	if err != nil {
+		return nil, err
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	var results []*Homework
+
+	// 提取所有含有 href 属性且 class 包含 "le2" 的 <a> 标签
+	mainDoc.Find("a.le2[href]").Each(func(i int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		text := strings.TrimSpace(s.Text())
+
+		// 匹配包含 course_column_preview_transfer.jsp 且文本中含 "作业" 的链接
+		if !strings.Contains(href, "course_column_preview_transfer.jsp") || !strings.Contains(text, "作业") {
+			return
+		}
+
+		// 提取 columnId
+		parsedURL, err := url.Parse(href)
+		if err != nil {
+			return
+		}
+		columnID := parsedURL.Query().Get("columnId")
+		if columnID == "" {
+			return
+		}
+
+		// 获取 column 页面
+		nextURL := fmt.Sprintf("%s/meol/buildless/colUrlStuView.do?columnId=%s", m.BaseURL, columnID)
+		time.Sleep(300 * time.Millisecond)
+
+		pageDoc, err := m.fetchDocument(nextURL, courseMainURL)
+		if err != nil {
+			return
+		}
+
+		// 处理 iframe
+		iframeSel := pageDoc.Find("iframe#main-content-two")
+		if iframeSel.Length() > 0 {
+			iframeSrc, _ := iframeSel.Attr("src")
+			if iframeSrc != "" {
+				if !strings.HasPrefix(iframeSrc, "http") {
+					if strings.HasPrefix(iframeSrc, "/") {
+						iframeSrc = m.BaseURL + iframeSrc
+					} else {
+						iframeSrc = m.BaseURL + "/" + iframeSrc
+					}
+				}
+				time.Sleep(500 * time.Millisecond)
+				pageDoc, err = m.fetchDocument(iframeSrc, nextURL)
+				if err != nil {
+					return
+				}
+			}
+		}
+
+		// 尝试解析竖向属性表格
+		parsedHW := false
+		iframeTable := pageDoc.Find("table.valuelist")
+		if iframeTable.Length() > 0 {
+			if hw, isVertical := m.parseVerticalHomeworkTable(iframeTable); isVertical {
+				parsedHW = true
+				if hw != nil {
+					results = append(results, hw)
+				}
+			}
+		}
+
+		// 如果竖向表解析失败，兼容回退查找 hwtid
+		if !parsedHW {
+			var hwtid string
+			// 优先找 class="enter" 的 a 标签
+			enterA := pageDoc.Find("a.enter[href]").First()
+			if enterA.Length() > 0 {
+				href, _ := enterA.Attr("href")
+				if strings.Contains(href, "hwtid=") {
+					parts := strings.Split(href, "hwtid=")
+					hwtid = strings.Split(parts[1], "&")[0]
+				}
+			}
+			if hwtid == "" {
+				// 兼容：直接搜索包含 hwtid= 的任一作业链接
+				pageDoc.Find("a[href]").EachWithBreak(func(i int, s *goquery.Selection) bool {
+					href, _ := s.Attr("href")
+					if strings.Contains(href, "hwtid=") {
+						parts := strings.Split(href, "hwtid=")
+						hwtid = strings.Split(parts[1], "&")[0]
+						return false
+					}
+					return true
+				})
+			}
+			if hwtid != "" {
+				// 获取作业详情
+				detailInfo, err := m.GetHomeworkDetail(hwtid)
+				if err == nil {
+					hw := &Homework{
+						HwTID:      hwtid,
+						Title:      detailInfo.Title,
+						DetailHref: fmt.Sprintf("%s/meol/common/hw/student/hwtask.view.jsp?hwtid=%s", m.BaseURL, hwtid),
+						Status:     "未知",
+					}
+					if hw.Title == "" {
+						hw.Title = text
+					}
+					results = append(results, hw)
+				}
+			}
+		}
+	})
+
+	return results, nil
+}
+
+// parseVerticalHomeworkTable 解析竖向属性表格 (valuelist) 中的作业信息
+// 返回 (*Homework, isVertical) — isVertical 表示表格是否为竖向布局
+func (m *Manager) parseVerticalHomeworkTable(table *goquery.Selection) (*Homework, bool) {
+	hw := &Homework{
+		Title:         "",
+		Deadline:      "",
+		Score:         "",
+		Publisher:     "",
+		SubmitHref:    "",
+		CanSubmit:     false,
+		IsGroup:       false,
+		Status:        "未知",
+		DetailHref:    "",
+		HasResult:     false,
+		ResultHref:    "",
+		TimeRemaining: "无截止时间",
+		IsUrgent:      false,
+	}
+
+	// 检查是否为竖向表格（每行 1 th + 1 td）
+	isVertical := true
+	table.Find("tr").EachWithBreak(func(i int, tr *goquery.Selection) bool {
+		ths := tr.Find("th")
+		tds := tr.Find("td")
+		if ths.Length() > 1 && tds.Length() == 0 {
+			isVertical = false
+			return false // break
+		}
+		return true
+	})
+	if !isVertical {
+		return nil, false
+	}
+
+	hasSubmitLink := false
+
+	table.Find("tr").Each(func(i int, tr *goquery.Selection) {
+		th := tr.Find("th").First()
+		td := tr.Find("td").First()
+		if th.Length() != 1 || td.Length() != 1 {
+			return
+		}
+
+		thText := strings.TrimSpace(th.Text())
+		tdText := strings.TrimSpace(td.Text())
+
+		switch {
+		case strings.Contains(thText, "标题"):
+			aTag := td.Find("a")
+			if aTag.Length() > 0 {
+				hw.Title = strings.TrimSpace(aTag.Text())
+				href, _ := aTag.Attr("href")
+				updateHwTID(hw, href, m.BaseURL)
+			}
+
+		case strings.Contains(thText, "截止时间"):
+			hw.Deadline = tdText
+
+		case strings.Contains(thText, "评分结果"):
+			hw.Score = tdText
+
+		case strings.Contains(thText, "发布人"):
+			hw.Publisher = tdText
+
+		case strings.Contains(thText, "提交作业"):
+			submitA := td.Find("a")
+			if submitA.Length() > 0 {
+				submitHref, _ := submitA.Attr("href")
+				if strings.HasPrefix(submitHref, "/") {
+					hw.SubmitHref = m.BaseURL + submitHref
+				} else if strings.HasPrefix(submitHref, "http") {
+					hw.SubmitHref = submitHref
+				} else {
+					hw.SubmitHref = m.BaseURL + "/meol/common/hw/student/" + submitHref
+				}
+				hasSubmitLink = true
+				updateHwTID(hw, submitHref, m.BaseURL)
+			}
+
+		case strings.Contains(thText, "查看结果"):
+			viewA := td.Find("a.view")
+			if viewA.Length() == 0 {
+				viewA = td.Find("a")
+			}
+			if viewA.Length() > 0 {
+				hw.ResultHref, _ = viewA.Attr("href")
+				hw.HasResult = true
+			}
+		}
+	})
+
+	// 没有提交链接则认为该作业已完成/未布置，不放入结果
+	if !hasSubmitLink {
+		return nil, true
+	}
+
+	// 确保有 detail_href
+	if hw.HwTID != "" && hw.DetailHref == "" {
+		hw.DetailHref = fmt.Sprintf("%s/meol/common/hw/student/hwtask.view.jsp?hwtid=%s", m.BaseURL, hw.HwTID)
+	}
+
+	// 计算 can_submit 和剩余时间
+	isNotExpired := true
+	hw.TimeRemaining = "无截止时间"
+	hw.IsUrgent = false
+
+	if hw.Deadline != "" {
+		layout := "2006年01月02日 15:04:05"
+		deadlineTime, err := time.ParseInLocation(layout, hw.Deadline, time.Local)
+
+		if err == nil {
+			now := time.Now()
+			isNotExpired = deadlineTime.After(now)
+			diff := deadlineTime.Sub(now)
+
+			if diff > 0 {
+				days := int(diff.Hours()) / 24
+				hours := int(diff.Hours()) % 24
+				minutes := int(diff.Minutes()) % 60
+
+				if days > 0 {
+					hw.TimeRemaining = fmt.Sprintf("%d天%d小时%d分钟", days, hours, minutes)
+				} else if hours > 0 {
+					hw.TimeRemaining = fmt.Sprintf("%d小时%d分钟", hours, minutes)
+				} else {
+					hw.TimeRemaining = fmt.Sprintf("%d分钟", minutes)
+				}
+
+				if diff.Hours() <= 24 {
+					hw.IsUrgent = true
+				}
+			} else {
+				hw.TimeRemaining = "已过期"
+				isNotExpired = false
+			}
+		} else {
+			hw.TimeRemaining = "时间格式错误"
+		}
+	}
+
+	isNotCompleted := hw.Score == "" || strings.TrimSpace(hw.Score) == "" || strings.Contains(hw.Score, "暂无分数")
+	hw.CanSubmit = hasSubmitLink && isNotExpired && isNotCompleted
+
+	return hw, true
+}
+
+// updateHwTID 从链接中提取 hwtid 并更新 Homework 字段
+func updateHwTID(hw *Homework, href, baseURL string) {
+	if strings.Contains(href, "hwtid=") {
+		parts := strings.Split(href, "hwtid=")
+		if len(parts) > 1 {
+			hw.HwTID = strings.Split(parts[1], "&")[0]
+			hw.DetailHref = fmt.Sprintf("%s/meol/common/hw/student/hwtask.view.jsp?hwtid=%s", baseURL, hw.HwTID)
+		}
+	}
+}
 
 // fetchDocument 统一的 HTTP 请求和 goquery 文档解析（包含转码逻辑）
 func (m *Manager) fetchDocument(url, referer string) (*goquery.Document, error) {
@@ -393,7 +693,7 @@ func (m *Manager) parseHomeworkRow(row *goquery.Selection) *Homework {
 		}
 	}
 
-	isNotCompleted := (hw.Score == "" || strings.TrimSpace(hw.Score) == "")
+	isNotCompleted := (hw.Score == "" || strings.TrimSpace(hw.Score) == "" || strings.Contains(hw.Score, "暂无分数"))
 
 	hw.CanSubmit = hasSubmitLink && isNotExpired && isNotCompleted
 

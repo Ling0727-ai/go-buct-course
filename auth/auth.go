@@ -33,6 +33,9 @@ func New() *BUCTAuth {
 	}
 }
 
+// userAgent 用于所有请求的 User-Agent 头
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+
 // Login 登录到北化课程平台
 func (a *BUCTAuth) Login(username, password string) error {
 	// 1. 重置 Session (对应 Python: self.session = requests.Session())
@@ -41,23 +44,45 @@ func (a *BUCTAuth) Login(username, password string) error {
 	a.Client.Jar = newJar
 	a.isLoggedIn = false
 
-	loginURL := fmt.Sprintf("%s/meol/loginCheck.do", a.BaseURL)
+	// 2. 先访问登录页面，获取初始 session cookie (JSESSIONID)
+	loginPageURL := fmt.Sprintf("%s/meol/login.do", a.BaseURL)
+	req, err := http.NewRequest("GET", loginPageURL, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", exceptions.ErrNetwork, err)
+	}
+	req.Header.Set("User-Agent", userAgent)
 
-	// 2. 构造表单数据
+	resp, err := a.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %v", exceptions.ErrNetwork, err)
+	}
+	resp.Body.Close()
+
+	// 3. 构造表单数据
 	formData := url.Values{}
 	formData.Set("IPT_LOGINUSERNAME", username)
 	formData.Set("IPT_LOGINPASSWORD", password)
+	formData.Set("logintoken", fmt.Sprintf("%d", time.Now().UnixMilli()))
 
-	// 3. 发送 POST 请求
-	// Client.PostForm 会自动处理 Content-Type: application/x-www-form-urlencoded
-	resp, err := a.Client.PostForm(loginURL, formData)
+	// 4. 发送 POST 请求
+	loginURL := fmt.Sprintf("%s/meol/loginCheck.do", a.BaseURL)
+	req, err = http.NewRequest("POST", loginURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("%w: %v", exceptions.ErrNetwork, err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", a.BaseURL)
+	req.Header.Set("Referer", loginPageURL)
+
+	resp, err = a.Client.Do(req)
 	if err != nil {
 		// 网络层面错误 (DNS, 连接拒绝, 超时等)
 		return fmt.Errorf("%w: %v", exceptions.ErrNetwork, err)
 	}
 	defer resp.Body.Close()
 
-	// 4. 检查登录是否成功
+	// 5. 检查登录是否成功
 	// http.Client 默认会自动跟随重定向。
 	// resp.Request.URL 就是最终重定向后的 URL。
 	finalURL := resp.Request.URL.String()
