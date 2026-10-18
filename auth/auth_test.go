@@ -698,6 +698,7 @@ func TestSetServiceSkipsSSOEntry(t *testing.T) {
 	cas := newFakeCAS(successLoginBody(relativeTicketService()))
 	a := newFakeAuth(cas)
 	a.SetService(fakeMEOLService)
+	a.SetLoginURL(casBase + "/login") // Explicit legacy protocol compatibility.
 
 	if err := a.Login("2024030178", "pw"); err != nil {
 		t.Fatalf("登录失败: %v", err)

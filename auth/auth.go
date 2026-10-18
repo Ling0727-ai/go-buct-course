@@ -1,9 +1,14 @@
 // Package auth 提供北化课程平台的认证能力。
 //
-// 登录流程（2026-09 起，统一身份认证）
+// 当前登录流程（2026-10，sidportal）
 // -----------------------------------
-// 课程平台 MEOL 已关闭旧的直连登录接口（/meol/loginCheck.do 现返回 404），
-// 改为统一身份认证。现在必须走 portal.buct.edu.cn 的 CAS：
+// MEOL SSO 重定向到 sidportal.buct.edu.cn/login 后，从 HTML 获取
+// login-page-flowkey（execution）和 login-croypto（Base64 AES 密钥）。
+// password 与 captcha_payload 使用 AES-ECB/PKCS#7 加密，表单 POST /login，
+// 跟随票据回跳建立 MEOL 会话。实现位于 sidportal.go；验证码/风控/MFA
+// 要求明确返回错误，不绕过，也不自动重放凭据。
+//
+// 兼容旧版 portal.buct.edu.cn CAS（按 SSO 重定向自动识别）：
 //
 //  1. GET  course.buct.edu.cn/meol/homepage/common/sso_login.jsp
 //     拿到本次登录的 service（形如
@@ -107,14 +112,17 @@ type BUCTAuth struct {
 	// BaseURL 课程平台基础地址
 	BaseURL string
 
-	isLoggedIn      bool
-	timeout         time.Duration
-	service         string
-	flowKey         string
-	publicKey       string
-	resolvedService string
-	meolSSOEntry    string
-	userAgent       string
+	isLoggedIn       bool
+	timeout          time.Duration
+	service          string
+	flowKey          string
+	publicKey        string
+	resolvedService  string
+	meolSSOEntry     string
+	userAgent        string
+	loginEntry       string // SSO-discovered sidportal login URL
+	loginURLOverride string // explicit authentication entry
+	activeSID        bool
 }
 
 // New 创建一个新的认证实例
@@ -256,6 +264,7 @@ func quoteAll(s string) string {
 // resolveService 确定本次登录的 service 参数。
 func (a *BUCTAuth) resolveService() (string, error) {
 	if a.service != "" {
+		a.loginEntry = sidPortalBase + "/login?service=" + url.QueryEscape(a.service)
 		return a.service, nil
 	}
 
@@ -286,6 +295,12 @@ func (a *BUCTAuth) resolveService() (string, error) {
 	if service == "" {
 		return "", fmt.Errorf("%w: SSO 入口未返回 service 参数", exceptions.ErrLogin)
 	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		parsed = resp.Request.URL.ResolveReference(parsed)
+	}
+	if isSIDLoginURL(parsed.String()) {
+		a.loginEntry = parsed.String()
+	}
 	return service, nil
 }
 
@@ -301,6 +316,13 @@ func (a *BUCTAuth) fetchFlowKey(service string) (string, error) {
 		return "", err
 	}
 	defer drainBody(resp)
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if target, err := req.URL.Parse(resp.Header.Get("Location")); err == nil && isSIDLoginURL(target.String()) {
+			a.loginEntry = target.String()
+			return "", errSIDRedirect
+		}
+	}
 
 	raw := a.cookieValue("COOKIE_INFO")
 	if raw == "" {
@@ -587,6 +609,11 @@ func (a *BUCTAuth) Login(username, password string) error {
 	a.isLoggedIn = false
 	a.flowKey = ""
 	a.resolvedService = ""
+	a.loginEntry = ""
+	a.activeSID = false
+	if username == "" || password == "" {
+		return fmt.Errorf("%w: 用户名或密码为空", exceptions.ErrLogin)
+	}
 
 	// 2. 确定 service
 	service, err := a.resolveService()
@@ -594,10 +621,30 @@ func (a *BUCTAuth) Login(username, password string) error {
 		return err
 	}
 	a.resolvedService = service
+	entry := a.loginEntry
+	if a.loginURLOverride != "" {
+		u, err := url.Parse(a.loginURLOverride)
+		if err != nil || u.User != nil || u.Scheme != "https" {
+			return fmt.Errorf("%w: 无效的认证入口", exceptions.ErrLogin)
+		}
+		q := u.Query()
+		q.Set("service", service)
+		u.RawQuery = q.Encode()
+		entry = u.String()
+		if !isSIDLoginURL(entry) && (u.Host != "portal.buct.edu.cn" || u.Path != "/cas/login") {
+			return fmt.Errorf("%w: 不支持的认证入口", exceptions.ErrLogin)
+		}
+	}
+	if isSIDLoginURL(entry) {
+		return a.loginSID(username, password, entry)
+	}
 
 	// 3. flowKey 一次性；若中途失效则整体重取一次
 	for attempt := 0; attempt < 2; attempt++ {
 		flowKey, err := a.fetchFlowKey(service)
+		if errors.Is(err, errSIDRedirect) {
+			return a.loginSID(username, password, a.loginEntry)
+		}
 		if err != nil {
 			return err
 		}
@@ -652,7 +699,11 @@ func (a *BUCTAuth) IsLoggedIn() bool {
 // Logout 注销登录
 func (a *BUCTAuth) Logout() {
 	// 尝试调用服务器注销接口，忽略错误
-	if req, err := a.newRequest(http.MethodGet, casBase+"/logout", nil); err == nil {
+	logoutURL := casBase + "/logout"
+	if a.activeSID {
+		logoutURL = sidPortalBase + "/logout"
+	}
+	if req, err := a.newRequest(http.MethodGet, logoutURL, nil); err == nil {
 		if resp, err := a.do(req); err == nil {
 			drainBody(resp)
 		}
@@ -664,6 +715,8 @@ func (a *BUCTAuth) Logout() {
 	a.isLoggedIn = false
 	a.flowKey = ""
 	a.resolvedService = ""
+	a.loginEntry = ""
+	a.activeSID = false
 }
 
 // SetBaseURL 设置基础URL

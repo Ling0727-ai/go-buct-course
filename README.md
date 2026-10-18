@@ -1,4 +1,6 @@
-BUCT Course 提醒工具（Go 版）
+# BUCT Course 提醒工具（Go 版）
+
+当前版本：**v1.0.0**。更新说明见 [CHANGELOG](CHANGELOG.md)。
 
 简介
 
@@ -6,7 +8,7 @@ BUCT Course 提醒工具（Go 版）
 
 主要功能
 
-- 登录 BUCT 统一身份认证（CAS，口令经 SM2 加密），并建立课程平台 MEOL 会话
+- 登录 BUCT 统一身份认证（新版 sidportal AES 表单，兼容旧版 CAS SM2），并建立课程平台 MEOL 会话
 - 获取待办作业（包含截止时间、是否可提交、任务描述等）
 - 获取可开始/待提交的测验列表（测验标题、时长、开始/结束时间、测试链接）
 - 在交互式命令行中显示汇总与详细任务信息
@@ -18,9 +20,12 @@ BUCT Course 提醒工具（Go 版）
 - `client/` — 客户端逻辑（BUCTClient）：登录、登出、获取任务与交互式界面
   - `client.go` — BUCTClient 类型与核心方法（New, Login, Logout, GetPendingTasks, GetHomeworkTasks）
   - `interactive.go` — 交互式 CLI 展示（登录提示、任务展示）
-- `auth/` — 认证相关（统一身份认证 CAS 登录、SM2 口令加密、session 管理，返回经过认证的 http.Client）
-  - `auth.go` — 登录流程编排（MEOL SSO 入口 -> CAS flowKey -> SM2 加密 -> 回跳 ticket）
-  - `sm2_crypto.go` — 纯 Go 的 SM3/SM2 实现（GM/T 0003/0004，线格式与站点 `sm2.min.js` 一致）
+- `auth/` — 认证相关（新版 sidportal、旧版 CAS、CookieJar 会话管理）
+  - `auth.go` — MEOL SSO 协议发现与登录分流，保留旧版 CAS 流程
+  - `sidportal.go` — 新版页面参数、AES-ECB/PKCS#7、验证码预检查、表单提交和回跳校验
+  - `sidportal_test.go` — 站点 JS 合成向量与新版离线流程测试
+  - `sm2_crypto.go` — 旧版纯 Go SM3/SM2 实现（GM/T 0003/0004）
+  - [新版登录协议分析](docs/sidportal-login.md) — 公开源码证据、字段来源和验证边界
 - `lid_utils/` — LID 管理（解析课程/测验 ID、从平台主页面提取课程列表与待办 LID）
 - `course_utils/` — 作业解析（抓取作业页面、解析作业表格和详细任务）
 - `exam/` — 测验解析（抓取测验列表、解析每条测验信息与详情）
@@ -96,11 +101,15 @@ func main() {
   - (*BUCTAuth) SetService(service string) — 指定 CAS 的 service；默认走课程平台 MEOL 的 SSO 入口
   - (*BUCTAuth) SetTimeout(d time.Duration) — 单次请求超时（默认 15 秒）
 
-- 认证流程（2026-09 起）
-  - 课程平台已关闭旧的直连登录接口（`/meol/loginCheck.do` 返回 404），改为 `portal.buct.edu.cn` 的统一身份认证。
-  - 流程：MEOL SSO 入口取 `service` → CAS 下发一次性 `flowKey` → 取 SM2 公钥 → 口令全角转半角后 SM2 加密 → 提交登录 → 跟随带 ticket 的回跳建立 MEOL 会话。
-  - `flowKey` 是一次性的（重复使用返回 180076），失效时 `Login` 会自动整体重取一次。
-  - 该实现不需要执行站点 JS，口令加密由纯 Go 的 SM3/SM2 完成，无额外第三方依赖。
+- 认证流程（2026-10 新版 sidportal）
+  - 默认从 MEOL SSO 入口获取本次 `service` 和认证重定向，自动识别新版 sidportal 或旧版 portal CAS。
+  - 新版：GET 登录页 → 读取 `login-page-flowkey`（`execution`）与 `login-croypto`（Base64 AES 密钥）→ 检查验证码要求 → AES-ECB/PKCS#7 加密口令和 `captcha_payload` → 表单 POST `/login` → 跟随票据回跳建立 MEOL 会话。
+  - 密码按原始 UTF-8 字符串加密，不做旧版的全角转半角转换。`croypto` 是站点实际使用的字段拼写。
+  - 每次登录重新获取页面参数和 Cookie；不重用抓包密文，不自动重试新版密码提交。需要验证码、风控或二次验证时明确报错，不绕过验证。
+  - 旧版 SM2/flowKey 流程仍保留；仅旧协议 flowKey 失效时重取一次。
+  - `SetService(service)` 跳过 MEOL 入口并默认使用新版（要求 HTTPS service）。如确需旧版，可显式调用 `SetLoginURL("https://portal.buct.edu.cn/cas/login")`；空字符串恢复自动发现。
+  - 新旧加密均由 Go 本地实现，不需要浏览器或 Node.js 运行时。
+  - 本次已完成公开 JS 分析、合成测试向量交叉验证和离线流程测试；未提交真实账号，线上端到端登录仍待用户本机验证。
 
 - 其他包（lid, course_utils, exam, utils）提供了更底层的抓取与解析函数，供高级调用或扩展使用。
 
@@ -122,6 +131,24 @@ func main() {
 - 转码问题：项目使用了 GBK -> UTF-8 的转码逻辑（utils.DecodeBodyToUTF8），这是为了解决平台返回 HTML 编码为 GBK 导致的中文乱码问题。
 
 开发与测试
+
+### 仅测试新版 sidportal（禁止回退）
+
+在仓库根目录的本机终端运行：
+
+```powershell
+go run ./cmd/sidportal-check
+```
+
+入口：[sidportal-check](cmd/sidportal-check/main.go)。终端输入学号和密码（密码不回显）；仅提交一次，不抓取作业。它同时指定 `SetService` 和 `SetLoginURL("https://sidportal.buct.edu.cn/login")`，并在 HTTP 传输层禁止旧门户及其他登录目标，服务器若要求跳回旧认证也会直接失败。日志不输出密码、密文、票据、Cookie 或用户名。此命令是实际联网登录，只在你运行并输入凭据时发生。
+
+离线验证该网络边界与新版协议：
+
+```powershell
+go test ./cmd/sidportal-check ./auth -run 'TestStrict|TestSID' -v
+```
+
+不要用 `go run .` 代替上述专用入口；根入口可能含自动登录配置，且未强制新版。
 
 - 代码静态检查/编译
   - go build ./...

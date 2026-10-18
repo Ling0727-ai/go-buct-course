@@ -1,1 +1,4 @@
 .idea/
+
+# Local reverse-engineering downloads can contain ephemeral authentication state.
+work/
