@@ -1,6 +1,6 @@
 # BUCT Course 提醒工具（Go 版）
 
-当前版本：**v1.0.0**。更新说明见 [CHANGELOG](CHANGELOG.md)。
+当前版本：**v1.1.0**。更新说明见 [CHANGELOG](CHANGELOG.md)。
 
 简介
 
